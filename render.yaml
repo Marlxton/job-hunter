@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: job-hunter-toni
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: JOOBLE_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.13.5
