@@ -1,5 +1,5 @@
 import os, re, json, sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -129,7 +129,11 @@ def analyse_cv(text):
         return {
             "skills": skills,
             "roles": roles,
-            "experience_years": 9,
+            "experience_years": 7.5,
+            "experience_breakdown": [
+                {"period":"2017–2021", "years":4.0, "type":"profesionalno iskustvo"},
+                {"period":"04/2023–danas", "years":3.5, "type":"profesionalno iskustvo"}
+            ],
             "leadership": 95,
             "process": 96,
             "technical": 82,
@@ -175,61 +179,90 @@ def analyse_cv(text):
 def job_score(j,p):
     blob=" ".join(str(j.get(k,"")) for k in ["title","snippet","company","location"]).lower()
     title=(j.get("title") or "").lower()
+    snippet=(j.get("snippet") or "").lower()
     a=p.get("analysis") or {}
-
     target_roles=p.get("target_roles") or []
-    role_hits={}
+
+    # Toni Score is intentionally conservative: an attractive title alone cannot
+    # produce a 95+ score. The score should reflect the whole job, not keywords only.
+    role_defs = {
+        "Project Manager": (92, ["project manager","voditelj projekta","voditelj projekata","project management"]),
+        "Process Manager": (94, ["process manager","process management","voditelj procesa","upravljanje procesima"]),
+        "Internal Control": (95, ["internal control","internal audit","unutarnji nadzor","unutarnja kontrola","kontrola"]),
+        "Business Analyst": (86, ["business analyst","business analysis","poslovni analitičar","poslovna analiza"]),
+        "Security Governance": (84, ["security governance","information security governance","governance","upravljanje sigurnošću"]),
+        "Information Security": (82, ["information security","informacijska sigurnost","it security"]),
+        "Operations Manager": (88, ["operations manager","operational manager","voditelj operacija","operativni manager"]),
+        "Technical Project Manager": (82, ["technical project manager","technical project management"]),
+    }
+
+    best_role=""; best_hits=0; best_base=65
     for role in target_roles:
-        phrases=ROLE_MAP.get(role,[role])
-        role_hits[role]=count_hits(blob,phrases)
-    best_role=max(role_hits,key=role_hits.get) if role_hits else ""
-    best_hits=role_hits.get(best_role,0)
-    role_match=min(100,45+best_hits*16) if best_hits else 20
+        base, phrases = role_defs.get(role,(78,ROLE_MAP.get(role,[role])))
+        hits=sum(1 for ph in phrases if ph in title)
+        # Also allow body evidence, but it is weaker than title evidence.
+        body_hits=sum(1 for ph in phrases if ph in snippet)
+        effective=hits*3 + body_hits
+        if effective > best_hits:
+            best_role, best_hits, best_base = role, effective, base
 
-    # Strong semantic boosts for the user's actual career direction.
-    manager_terms=["manager","voditelj","lead","head","project","process","business analyst","analyst","specialist","specijalist","governance","internal control","internal audit"]
-    technical_role_terms=["technician","tehničar","serviser","service technician","field technician","helpdesk","support technician","developer"]
-    leadership_bonus=12 if any(x in title for x in manager_terms) else 0
-    technical_penalty=25 if any(x in title for x in technical_role_terms) else 0
+    if not best_role:
+        best_role="general"
+        best_base=60
 
-    cv_skills=[x["name"] for x in a.get("skills",[])]
-    matched=[]
-    for s in cv_skills:
-        if any(q in blob for q in SKILL_MAP.get(s,[])):
-            matched.append(s)
-    skill_match=min(100,42+len(matched)*7)
-    if len(matched)>=5: skill_match=min(100,skill_match+10)
+    role_match=min(97, best_base + min(5, max(0,best_hits-1)*2))
 
-    experience=(a.get("leadership",65)*.25+a.get("process",65)*.25+
-                a.get("analysis",65)*.25+a.get("stakeholder",65)*.25)
+    # Competence match: count only meaningful profile competencies.
+    skill_scores=[]
+    for skill, phrases in SKILL_MAP.items():
+        if not any(ph in blob for ph in phrases):
+            continue
+        skill_scores.append(skill)
+    skill_match=min(94, 48 + len(skill_scores)*5)
 
-    loc=100 if p.get("location","").lower() in (j.get("location") or "").lower() else 60
-    senior=100 if any(x in title for x in ["manager","voditelj","lead","senior","head","specialist","specijalist"]) else 68
+    # Relevant experience is based on the real CV total (~7.5 years), not an
+    # invented 9-year figure. Leadership/process/analysis are profile strengths.
+    exp_years=float(a.get("experience_years",7.5) or 7.5)
+    experience=min(96, 60 + min(exp_years,10)*3 + (5 if a.get("leadership",0)>=90 else 0))
 
-    negative=sum(1 for x in p.get("excluded",[]) if x.lower() in blob)
-    penalty=min(50,negative*20)
+    # Seniority/leadership fit.
+    senior_terms=["manager","voditelj","lead","head","senior","specijalist","specialist"]
+    senior=92 if any(x in title for x in senior_terms) else 70
+    if "junior" in title: senior-=15
+    if "intern" in title or "student" in title or "praksa" in title: senior-=35
+    senior=max(30,senior)
 
-    # Career-fit weighting: role/skills/experience dominate location.
-    score=(
-        role_match*.34 +
-        skill_match*.28 +
-        experience*.22 +
-        loc*.08 +
-        senior*.08 +
-        leadership_bonus -
-        technical_penalty -
-        penalty
-    )
+    loc=100 if p.get("location","").lower() in (j.get("location") or "").lower() else 65
+
+    # Explicit exclusions and technician-style roles are strong negative signals.
+    excluded=p.get("excluded",[])
+    negative_terms=[x.lower() for x in excluded if x]
+    negative_hits=[x for x in negative_terms if x in blob]
+    technical_role_terms=["technician","tehničar","serviser","service technician","field technician","helpdesk","support technician","developer","programmer","programer"]
+    technical_penalty=18 if any(x in title for x in technical_role_terms) else 0
+    intern_penalty=25 if any(x in title for x in ["intern","student","trainee","praksa"]) else 0
+    penalty=min(45,len(negative_hits)*16)+technical_penalty+intern_penalty
+
+    # Technical Project Manager is a valid target, but not the user's strongest
+    # lane; cap the score slightly unless the ad strongly matches project/process
+    # and leadership rather than hands-on engineering.
+    if "technical project manager" in title:
+        if not any(x in snippet for x in ["koordin", "project management", "stakeholder", "process", "dobavlja", "rok"]):
+            role_match=min(role_match,82)
+
+    score=(role_match*.30 + skill_match*.25 + experience*.20 + senior*.12 + loc*.08 +
+           min(100, a.get("stakeholder",80))*.05 - penalty)
     score=max(0,min(100,round(score)))
 
     reasons=[]
-    if best_role and best_hits: reasons.append(f"najbliža ciljanoj ulozi: {best_role}")
-    if matched: reasons.append("kompetencije: "+", ".join(matched[:4]))
-    if a.get("experience_years"): reasons.append(f"profil ima oko {a['experience_years']} godina iskustva")
+    if best_role!="general": reasons.append(f"najbliža ciljanoj ulozi: {best_role}")
+    if skill_scores: reasons.append("kompetencije: "+", ".join(skill_scores[:4]))
+    if exp_years: reasons.append(f"oko {exp_years:g} godina relevantnog iskustva")
     if loc==100: reasons.append("lokacija odgovara")
-    if technical_penalty: reasons.append("uloga je pretežno tehnička, što nije primarni cilj")
-    if negative: reasons.append("sadrži neželjeno područje: "+", ".join(x for x in p.get("excluded",[]) if x.lower() in blob)[:100])
-    if not reasons: reasons.append("podudaranje prema sadržaju i razini oglasa")
+    if "junior" in title or "intern" in title or "student" in title: reasons.append("razina je niža od ciljane managerske/senior razine")
+    if technical_penalty: reasons.append("uloga je pretežno tehnička")
+    if negative_hits: reasons.append("sadrži neželjeno područje: "+", ".join(negative_hits[:3]))
+    if not reasons: reasons.append("podudaranje prema ulozi, kompetencijama i razini odgovornosti")
 
     breakdown={
         "role":round(role_match),
